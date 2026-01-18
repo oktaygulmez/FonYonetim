@@ -236,7 +236,7 @@ namespace FonYonetim
             }
             else
             {
-                //hiçbir işlem yapılmayacak
+                //hiçbir işlem yapılmayacakk
             }
 
             NasdaqDataGridListele();
