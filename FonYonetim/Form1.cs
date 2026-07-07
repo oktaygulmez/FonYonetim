@@ -4,8 +4,12 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using OpenQA.Selenium;
+using OpenQA.Selenium.Chrome;
+using OpenQA.Selenium.Support.UI;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -14,15 +18,27 @@ using System.Reflection;
 using System.Security.Policy;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using static System.Windows.Forms.VisualStyles.VisualStyleElement;
+using HtmlAgilityPack;
 
 namespace FonYonetim
 {
+
     public partial class Form1 : Form
     {
+        private static string NormalizeSymbol(string symbol)
+        {
+            return symbol
+             .Trim()
+             .ToUpperInvariant()
+             .Replace('İ', 'I')
+             .Replace('ı', 'I');
+        }
+
         public void DataGridListele()
         {
             dataGridView2.DataSource = c.StockMarkets.OrderBy(x => x.StockMarketTargetPricePercent).ToList();
@@ -312,84 +328,84 @@ namespace FonYonetim
         public string html;
         private void button4_Click(object sender, EventArgs e)
         {
-            url = new Uri("http://bigpara.hurriyet.com.tr/borsa/hisse-senetleri/");
-
-            //8 WEB SAYFASI İÇİN 8'LİK DÖNGÜ
-            for (int sayfa = 1; sayfa <= 7; sayfa++)
+            try
             {
-                try
-                {
-                    url = new Uri("http://bigpara.hurriyet.com.tr/borsa/hisse-fiyatlari/" + sayfa + "/");
-                }
-                catch (UriFormatException)
-                {
-                    if (MessageBox.Show("Hatalı Url", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
+                ChromeOptions options = new ChromeOptions();
+                options.AddArgument("--headless=new");
+                options.AddArgument("--disable-gpu");
+                options.AddArgument("--window-size=1920,5000");
+                options.AddArgument("--log-level=3");
 
-                    }
-                }
-                catch (ArgumentException)
+                using (IWebDriver driver = new ChromeDriver(options))
                 {
-                    if (MessageBox.Show("Hatalı Url", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
+                    driver.Navigate().GoToUrl("https://bigpara.hurriyet.com.tr/borsa/en-cok-artanlar/");
 
-                    }
-                }
-                WebClient client2 = new WebClient();
-                client2.Encoding = Encoding.UTF8;
-                try
-                {
-                    html = client2.DownloadString(url);
-                }
-                catch (WebException)
-                {
-                    if (MessageBox.Show("Hatalı Url", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
+                    WebDriverWait wait = new WebDriverWait(driver, TimeSpan.FromSeconds(5));
 
-                    }
-                }
-                HtmlAgilityPack.HtmlDocument doc2 = new HtmlAgilityPack.HtmlDocument();
-                doc2.LoadHtml(html);
-                //45 SATIR İÇİN 45'LİK DÖNGÜ
-                try
-                {
-                    string HisseAdi;
-                    string GüncelFiyat;
-                    for (int say = 1; say <= 45; say++)
+                    wait.Until(d => d.FindElements(By.CssSelector("tr[data-symbol-id]")).Count > 0);
+
+                    // Gizli satırları görünür yap
+                    ((IJavaScriptExecutor)driver).ExecuteScript(@"
+                document.querySelectorAll('tr.d-none').forEach(x => x.classList.remove('d-none'));
+            ");
+
+                    // Fiyatlar dolana kadar bekle (Thread.Sleep yerine)
+                    wait = new WebDriverWait(driver, TimeSpan.FromSeconds(2));
+                    wait.Until(d =>
+                        d.FindElements(By.CssSelector("td[data-column='c']"))
+                         .Any(x => !string.IsNullOrWhiteSpace(x.Text)));
+
+                    var satirlar = driver.FindElements(By.CssSelector("tr[data-symbol-id]"));
+
+                    var sirketler = c.Bists.ToDictionary(
+                        x => NormalizeSymbol(x.BistMarketSymbol).Trim(),
+                        StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var satir in satirlar)
                     {
                         try
                         {
-                            HisseAdi = (doc2.DocumentNode.SelectSingleNode("//*[@id='content']/div[2]/div[6]/div/div/div[2]/ul[" + say + "]/li[1]").InnerText);
-                            GüncelFiyat = ((doc2.DocumentNode.SelectSingleNode("//*[@id='content']/div[2]/div[6]/div/div/div[2]/ul[" + say + "]/li[2]").InnerText));
+                            string hisseAdi = NormalizeSymbol(
+                                satir.FindElement(By.CssSelector(".symbol-name")).Text);
 
-                            var sirket = c.Bists.Where(x => x.BistMarketSymbol == HisseAdi).FirstOrDefault();
+                            if (!sirketler.TryGetValue(hisseAdi, out var sirket))
+                                continue;
 
-                            if (sirket != null)
-                            {
-                                sirket.BistMarketPrice = double.Parse(GüncelFiyat);
-                                sirket.BistMarketTargetPricePercent = Convert.ToDouble((((sirket.BistMarketTargetPrice / sirket.BistMarketPrice) - 1) * 100).ToString("0.00"));
-                                c.Bists.Update(sirket);
-                                c.SaveChanges();
-                            }
+                            string fiyatText = satir
+                                .FindElement(By.CssSelector("td[data-column='c']"))
+                                .Text
+                                .Trim();
 
-                            if (HisseAdi == "ZOREN")
-                            {
-                                say = 46; //zoren son şirket ondan sonra devam etmeye gerek yok. alfabetik gidiyor.
-                            }
+                            string parseFiyat = fiyatText
+                                .Replace(".", "")
+                                .Replace(",", ".");
+
+                            if (!double.TryParse(
+                                parseFiyat,
+                                NumberStyles.Any,
+                                CultureInfo.InvariantCulture,
+                                out double fiyat))
+                                continue;
+
+                            sirket.BistMarketPrice = fiyat;
+
+                            sirket.BistMarketTargetPricePercent =
+                                Math.Round(
+                                    ((sirket.BistMarketTargetPrice / fiyat) - 1) * 100,
+                                    2);
                         }
                         catch
                         {
-                            //Son sayfada 45 satır yok. Hata verirse hiçbir şey yapma!!
+                            // Hatalı hisseyi geç
                         }
                     }
-                }
-                catch (NullReferenceException)
-                {
-                    if (MessageBox.Show("Hatalı xPath", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
 
-                    }
+                    c.SaveChanges();
                 }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message);
             }
 
             BistDataGridListele();
@@ -500,90 +516,95 @@ namespace FonYonetim
 
         private void button10_Click(object sender, EventArgs e)
         {
-            url = new Uri("http://bigpara.hurriyet.com.tr/borsa/hisse-senetleri/");
-
             double dolarFiyati = Convert.ToDouble(label10.Text);
 
-            //8 WEB SAYFASI İÇİN 8'LİK DÖNGÜ
-            for (int sayfa = 1; sayfa <= 7; sayfa++)
+            try
             {
-                try
-                {
-                    url = new Uri("http://bigpara.hurriyet.com.tr/borsa/hisse-fiyatlari/" + sayfa + "/");
-                }
-                catch (UriFormatException)
-                {
-                    if (MessageBox.Show("Hatalı Url", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
+                ChromeOptions options = new ChromeOptions();
+                options.AddArgument("--headless=new");
+                options.AddArgument("--disable-gpu");
+                options.AddArgument("--window-size=1920,5000");
+                options.AddArgument("--log-level=3");
 
-                    }
-                }
-                catch (ArgumentException)
+                using (IWebDriver driver = new ChromeDriver(options))
                 {
-                    if (MessageBox.Show("Hatalı Url", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
+                    driver.Navigate().GoToUrl("https://bigpara.hurriyet.com.tr/borsa/en-cok-artanlar/");
 
-                    }
-                }
-                WebClient client2 = new WebClient();
-                client2.Encoding = Encoding.UTF8;
-                try
-                {
-                    html = client2.DownloadString(url);
-                }
-                catch (WebException)
-                {
-                    if (MessageBox.Show("Hatalı Url", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
+                    WebDriverWait wait = new WebDriverWait(driver, TimeSpan.FromSeconds(5));
 
-                    }
-                }
-                HtmlAgilityPack.HtmlDocument doc2 = new HtmlAgilityPack.HtmlDocument();
-                doc2.LoadHtml(html);
-                //45 SATIR İÇİN 45'LİK DÖNGÜ
-                try
-                {
-                    string HisseAdi;
-                    string GüncelFiyat;
-                    for (int say = 1; say <= 45; say++)
+                    wait.Until(d => d.FindElements(By.CssSelector("tr[data-symbol-id]")).Count > 0);
+
+                    // Gizli satırları görünür yap
+                    ((IJavaScriptExecutor)driver).ExecuteScript(@"
+                document.querySelectorAll('tr.d-none').forEach(x => x.classList.remove('d-none'));
+            ");
+
+                    // Fiyatlar dolana kadar bekle (Thread.Sleep yerine)
+                    wait = new WebDriverWait(driver, TimeSpan.FromSeconds(2));
+                    wait.Until(d =>
+                        d.FindElements(By.CssSelector("td[data-column='c']"))
+                         .Any(x => !string.IsNullOrWhiteSpace(x.Text)));
+
+                    var satirlar = driver.FindElements(By.CssSelector("tr[data-symbol-id]"));
+
+                    var sirketler = c.BistDolars
+    .AsEnumerable()
+    .GroupBy(x => NormalizeSymbol(x.BistMarketSymbol))
+    .ToDictionary(
+        g => g.Key,
+        g => g.First(),
+        StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var satir in satirlar)
                     {
                         try
                         {
+                            string hisseAdi = NormalizeSymbol(
+                                satir.FindElement(By.CssSelector(".symbol-name")).Text);
 
-                            HisseAdi = (doc2.DocumentNode.SelectSingleNode("//*[@id='content']/div[2]/div[6]/div/div/div[2]/ul[" + say + "]/li[1]").InnerText);
-                            GüncelFiyat = ((doc2.DocumentNode.SelectSingleNode("//*[@id='content']/div[2]/div[6]/div/div/div[2]/ul[" + say + "]/li[2]").InnerText));
+                            if (!sirketler.TryGetValue(hisseAdi, out var sirket))
+                                continue;
 
-                            var sirket = c.BistDolars.Where(x => x.BistMarketSymbol == HisseAdi).FirstOrDefault();
+                            string fiyatText = satir
+                                .FindElement(By.CssSelector("td[data-column='c']"))
+                                .Text
+                                .Trim();
 
-                            if (sirket != null)
-                            {
-                                sirket.BistMarketPriceDolar = Math.Round(double.Parse(GüncelFiyat) / dolarFiyati, 2);
-                                sirket.BistMarketTargetPricePercent = Convert.ToDouble((((sirket.BistMarketTargetPriceDolar / sirket.BistMarketPriceDolar) - 1) * 100).ToString("0.00"));
-                                c.BistDolars.Update(sirket);
-                                c.SaveChanges();
-                            }
+                            string parseFiyat = fiyatText
+                                .Replace(".", "")
+                                .Replace(",", ".");
 
-                            if (HisseAdi == "ZOREN")
-                            {
-                                say = 46; //zoren son şirket ondan sonra devam etmeye gerek yok. alfabetik gidiyor.
-                            }
+                            if (!double.TryParse(
+                                parseFiyat,
+                                NumberStyles.Any,
+                                CultureInfo.InvariantCulture,
+                                out double fiyat))
+                                continue;
+
+                            sirket.BistMarketPriceDolar = Math.Round(fiyat / dolarFiyati, 2);
+
+                            sirket.BistMarketTargetPricePercent =
+                                Math.Round(
+                                    ((sirket.BistMarketTargetPriceDolar / sirket.BistMarketPriceDolar) - 1) * 100,
+                                    2);
                         }
                         catch
                         {
-                            //Son sayfada 45 satır yok. Hata verirse hiçbir şey yapma!!
+                            // Hatalı hisseyi geç
                         }
                     }
-                }
-                catch (NullReferenceException)
-                {
-                    if (MessageBox.Show("Hatalı xPath", "Hata", MessageBoxButtons.OK, MessageBoxIcon.Error) == DialogResult.OK)
-                    {
 
-                    }
+                    c.SaveChanges();
                 }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(ex.Message);
             }
 
             BistDolarDataGridListele();
+
+
         }
     }
 }
